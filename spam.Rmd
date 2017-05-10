@@ -1,0 +1,926 @@
+---
+title: "Assignment 3"
+author: "Christina Macholan"
+fig_caption: yes
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+number_section: yes
+fontsize: 9pt
+subtitle: Predictive Modeling in Binary Classification
+affiliation: PREDICT 454 SECTION 55
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r datastep, include = FALSE}
+spam.raw <- read.csv("spambase.data")
+spamnames <- read.csv("spambasenames.csv", header = FALSE)
+names(spam.raw) <- c(as.character(spamnames[,1]),"is_spam")
+spam.raw$is_spam <- as.factor(ifelse(spam.raw$is_spam > 0, "Spam", "Not Spam"))
+
+#add flag variables for presence of word or not
+flag.variables <- as.data.frame(apply(spam.raw[,1:54], 2, function(x) as.factor(ifelse(x == 0, "Missing", "Present"))))
+colnames(flag.variables) <- paste0("missing_", gsub("_freq","", colnames(flag.variables)))
+
+#take log of all continuous values greater than zero
+log.variables <- as.data.frame(cbind(apply(spam.raw[,1:54], 2, function(x) ifelse(x == 0, 0, log10(x*1000))),
+                                     apply(spam.raw[,55:57], 2, function(x) ifelse(x == 0, 0, log10(x+1)))))
+colnames(log.variables) <- paste0("log_", colnames(log.variables))
+head(log.variables)
+
+#take log of all continuous values greater than zero
+lower.quantiles <- apply(log.variables[,1:57], 2, function(x) quantile(x[x>0], probs = 0.01, na.rm = T))
+upper.quantiles <- apply(log.variables[,1:57], 2, function(x) quantile(x[x>0], probs = 0.99, na.rm = T))
+
+lower.outliers <- log.variables
+for (i in 1:length(lower.quantiles)) {
+    lower.outliers[,i] <- as.factor(ifelse(log.variables[,i] < lower.quantiles[i],
+                                 ifelse(log.variables[i] > 0, 1, 0), 0))
+}
+colnames(lower.outliers) <- paste0("flag_low_", colnames(log.variables))
+head(lower.outliers)
+summary(lower.outliers)
+
+lower.level.count <- c()
+for (i in 1:ncol(lower.outliers)) {
+    lower.level.count[i] <- nlevels(lower.outliers[,i])
+}
+lower.outliers <- lower.outliers[, -c(which(lower.level.count==1))]
+
+upper.outliers <- log.variables
+for (i in 1:length(lower.quantiles)) {
+    upper.outliers[,i] <- as.factor(ifelse(log.variables[,i] > upper.quantiles[i], 1, 0))
+}
+colnames(upper.outliers) <- paste0("flag_high_", colnames(log.variables))
+head(upper.outliers)
+summary(upper.outliers)
+
+upper.level.count <- c()
+for (i in 1:ncol(upper.outliers)) {
+    upper.level.count[i] <- nlevels(upper.outliers[,i])
+}
+upper.outliers <- upper.outliers[, -c(which(upper.level.count==1))]
+
+
+spam <- cbind(spam.raw[,c(1:57)], flag.variables, log.variables, is_spam = spam.raw[,58])
+
+summary(spam)
+
+table(spam$missing_word_cs, spam$is_spam)
+table(spam$missing_word_telnet, spam$is_spam)
+table(spam$missing_word_857, spam$is_spam)
+table(spam$missing_word_george, spam$is_spam)
+table(spam$missing_word_415, spam$is_spam)
+table(spam$missing_word_650, spam$is_spam)
+table(spam$missing_word_lab, spam$is_spam)
+table(spam$missing_word_labs, spam$is_spam)
+
+```
+
+# Data Overview
+
+In this exercise, we explore whether or not it is possible to reliably distinguish unsolicited bulk email -- also known as spam -- from the rest of a user's incoming emails. Building a model that can act as a spam filter benefits the email recipients who would otherwise waste time sorting and disposing of the messages manually. The filter can also benefit Internet Service Providers (ISPs) whose systems can become bogged down with delivering large quantities of spam.
+
+The data set we use to build the spam filtration models is provided by Univeristy of California Irvine ([https://archive.ics.uci.edu/ml/datasets/Spambase](https://archive.ics.uci.edu/ml/datasets/Spambase)). It contains 58 variables, including:
+* 57 Predictor Variables
+    + 48 continuous variables ranging from 0 to 100 that measure the frequency of specific words in the email body (e.g. 100 * count of WORD / total words)
+    + 6 continuous variables ranging from 0 to 100 that measure the frequency of specific characters in the email body (e.g. 100 * count of WORD / total words)
+    + 3 continous variables that record the average, longest, and total sequence of consecutive capital letters in the email body
+* 1 Response Variable
+    + A binary classification variable that distinguishes emails that are spam (1) from those that are not (0).
+    
+Table A.1 in the appendix describes each of the 58 variables in detail.
+
+Our baseline accuracy for prediction should start at `r round((2788/(2788+1812))*100,2)`, which would be the prediction accuracy if we predicted all cases as not spam. This model would have a 0% false positive rate.
+
+
+``` {r responseplot, echo = FALSE, fig.cap = "Frequency of spam emails in UCI dataset", fig.height = 3, fig.width = 4, fig.aligh = "center"}
+
+# set colors to match ggplot defaults that will be used in subsequent graphs
+my.colors <- c("#F8766D", "#00BFC4")
+
+plot(spam$is_spam, col = my.colors)
+
+```
+
+
+# Data Quality Check
+
+``` {r predictorplots, echo = FALSE, include = FALSE, fig.width = 8, fig.height = 2.5, warning=FALSE, message=FALSE}
+# my.colors <- c("#F8766D", "#00BFC4")
+library(ggplot2)
+library(scales)
+library(gridExtra)
+
+var.list = names(spam)[c(1:57,169)]
+density.plot.list<- list()
+for (i in 1:57) {
+    d <- ggplot(spam, aes_string(x = var.list[[i]], color = var.list[[58]], fill = var.list[[58]])) + 
+        geom_histogram(alpha = 0.4, bins = 20) + 
+        #scale_x_log10() +
+        #scale_y_continuous(labels = percent_format(),) + 
+        xlab(toupper(gsub(".*_", " ", var.list[[i]]))) +
+        ylab("") +
+        ggtitle("Density - Spam vs. Not") +
+        theme(legend.position="none", plot.title = element_text(hjust = 0.5))
+    density.plot.list[[i]] <- d
+}   
+rm(i,d,var.list)
+
+var.list = names(spam)[c(1:57,169)]
+violin.plot.list<- list()
+for (i in 1:57) {
+    v <- ggplot(spam, aes_string(y = var.list[[i]], x = var.list[[58]], color = var.list[[58]], fill = var.list[[58]])) + 
+        geom_violin(alpha = 0.4, trim = FALSE) + 
+        geom_boxplot(width = 0.1, fill = "white", alpha = 0.6) +
+        scale_y_log10() +
+        #scale_y_continuous(labels = percent_format(), limits = c(0,1.25)) + 
+        xlab("") +
+        ylab(toupper(paste0("LOG ", gsub(".*_", " ", var.list[[i]])," - 0 OMITTED"))) +
+        coord_flip() +
+        ggtitle("Density - Spam vs. Not") +
+        theme(legend.position="none", plot.title = element_text(hjust = 0.5))
+    violin.plot.list[[i]] <- v
+}   
+rm(i,v,var.list)
+
+var.list = names(spam)[c(58:111,169)]
+frequency.plot.list<- list()
+for (i in 1:54) {
+    f <- ggplot(spam, aes_string(x=var.list[[i]], fill = var.list[[55]]), color = var.list[[55]]) + 
+        geom_bar(position = "fill", alpha = 0.6) + 
+        scale_y_continuous(labels = percent_format()) + 
+        xlab(toupper(gsub(".*_", " ", var.list[[i]]))) +
+        ylab("") +
+        ggtitle("Frequency - Spam vs. Not") +
+        theme(legend.position="none", plot.title = element_text(hjust = 0.5))
+    frequency.plot.list[[i]] <- f
+}
+rm(i,f,var.list)
+```
+
+``` {r responseplotsdisplay, echo = FALSE, include = FALSE, fig.width = 9.5, fig.height = 2.2, warning=FALSE, message=FALSE}
+for (i in 1:54) {
+    grid.arrange(frequency.plot.list[[i]], density.plot.list[[i]], violin.plot.list[[i]], ncol = 3, nrow = 1)
+}
+rm(i)
+
+for (i in 55:57) {
+    grid.arrange(density.plot.list[[i]], violin.plot.list[[i]], ncol = 2, nrow = 1)
+}
+rm(i)
+
+```
+
+# Exploratory Data Analysis
+
+```{r correlations, echo=FALSE, fig.width = 4, fig.height = 5, fig.align = "center"}
+library(corrplot)
+
+corrplot(cor(spam[,20:40]), 
+         method = "color", tl.col = "black", tl.cex = 0.5, cl.cex = 0.5)
+```
+
+
+# Training & Validation Split
+
+
+```{r}
+spam.model <- cbind(flag.variables, log.variables, upper.outliers, lower.outliers, is_spam = spam.raw[,58])
+spam.model[,1:54] <- apply(spam.model[,1:54], 2, function(x) as.numeric(ifelse(x == "Missing", 1, 0)))
+
+train.size <- round(0.70*nrow(spam.model))
+set.seed(1234)
+spam.train.sample <- sample(1:nrow(spam.model), nrow(spam.model), replace = FALSE)
+spam.model$train <- NA
+for (i in 1:nrow(spam.model)) {
+  spam.model$part[i] <- ifelse(spam.train.sample[i] <= train.size, "train", "valid")
+}
+
+data.train <- spam.model[spam.model$part=="train",]
+x.train <- data.train[,c(1:218)]
+c.train <- data.train[,219] 
+n.train.c <- length(c.train) 
+
+data.valid <- spam.model[spam.model$part=="valid",]
+x.valid <- data.valid[,c(1:218)]
+c.valid <- data.valid[,219] 
+n.valid.c <- length(c.valid) 
+
+x.train.mean <- apply(x.train[,c(109:111)], 2, function(x) mean(x[!is.na(x)]))
+x.train.sd <- apply(x.train[,c(109:111)], 2, function(x) sd(x[!is.na(x)]))
+x.train.std <- t((t(x.train[,c(109:111)])-x.train.mean)/x.train.sd) # standardize to have zero mean and unit sd
+apply(x.train.std, 2, function(x) mean(x[!is.na(x)])) # check zero mean
+apply(x.train.std, 2, function(x) sd(x[!is.na(x)])) # check unit sd
+data.train.std.c <- data.frame(x.train[,1:108], x.train.std[,1:3], x.train[,112:218],is_spam=c.train) # to classify 
+
+x.valid.std <- t((t(x.valid[,c(109:111)])-x.train.mean)/x.train.sd) # standardize using training mean and sd
+data.valid.std.c <- data.frame(x.valid[,1:108], x.valid.std[,1:3], x.valid[,112:218], is_spam=c.valid) # to classify 
+names(data.valid.std.c)
+
+drops <- c("flag_high_log_word_freq_table","flag_high_log_word_freq_parts","flag_high_log_word_freq_labs","flag_high_log_word_freq_3d")
+data.train.std.c <- data.train.std.c[, !(names(data.train.std.c) %in% drops)]
+data.valid.std.c <- data.valid.std.c[, !(names(data.valid.std.c) %in% drops)]
+names(data.train.std.c)
+names(data.valid.std.c)
+
+
+```
+
+## BUILD CLASSIFICATION MODELS
+
+
+```{r}
+my.function.1 <- function(pred, valid, ref) {
+    require(caret)
+    c.hat.valid <- pred
+    cf <- confusionMatrix(c.hat.valid, valid, positive = ref)
+    
+    return(list(CutOff = NA,
+                Accuracy = round(100*((cf$table[1]+cf$table[4])/(cf$table[1]+cf$table[2]+cf$table[3]+cf$table[4])),2),
+                FallOut = round(100*(cf$table[2]/(cf$table[1]+cf$table[2])),2),
+                MissRate = round(100*(cf$table[3]/(cf$table[3]+cf$table[4])),2),
+                ConfusionMatrix = table(c.hat.valid,valid)))
+}
+
+my.function.fallout <- function(pred, valid, ref) {
+    require(caret)
+    pred.grid <- seq(0.01, 0.99, by = 0.01)
+    accuracy <- c()
+    fallout <- c()
+    miss <- c()
+    
+    for (i in 1:length(pred.grid)){
+        c.hat.valid <- ifelse(pred>=pred.grid[i], "Spam", "Not Spam")
+        cf <- confusionMatrix(c.hat.valid, valid, positive = ref)
+        accuracy[i] <- round(100*((cf$table[1]+cf$table[4])/(cf$table[1]+cf$table[2]+cf$table[3]+cf$table[4])),2)
+        fallout[i] <- round(100*(cf$table[2]/(cf$table[1]+cf$table[2])),2)
+        miss[i] <- round(100*(cf$table[3]/(cf$table[3]+cf$table[4])),2)
+    }
+    
+    cutoff.level.fallout <- which.min(fallout)
+    c.hat.valid <- ifelse(pred>=cutoff.level.fallout/100, "Spam", "Not Spam")
+    cf <- confusionMatrix(c.hat.valid, valid, positive = ref)
+
+    return(list(CutOff = cutoff.level.fallout / 100,
+                AccuracyRate = accuracy[cutoff.level.fallout],
+                FalloutRate = round(100*(cf$table[2]/(cf$table[1]+cf$table[2])),2),
+                MissRate = round(100*(cf$table[3]/(cf$table[3]+cf$table[4])),2),
+                ConfusionMatrix = table(c.hat.valid,valid),
+                FallOutVsAccuracy = cbind(Cutoff = pred.grid, FalloutRate = fallout, AccuracyRate = accuracy, 
+                                          MissRate = miss),
+                AccuracyPlot = plot(pred.grid,fallout)))
+}
+
+my.function.accuracy <- function(pred, valid, ref) {
+    require(caret)
+    pred.grid <- seq(0.01, 0.99, by = 0.01)
+    accuracy <- c()
+    fallout <- c()
+    miss <- c()
+
+    for (i in 1:length(pred.grid)){
+        c.hat.valid <- ifelse(pred>=pred.grid[i], "Spam", "Not Spam")
+        cf <- confusionMatrix(c.hat.valid, valid, positive = ref)
+        accuracy[i] <- round(100*((cf$table[1]+cf$table[4])/(cf$table[1]+cf$table[2]+cf$table[3]+cf$table[4])),2)
+        fallout[i] <- round(100*(cf$table[2]/(cf$table[1]+cf$table[2])),2)
+        miss[i] <- round(100*(cf$table[3]/(cf$table[3]+cf$table[4])),2)
+    }
+    
+    cutoff.level.accuracy <- which.max(accuracy)
+    c.hat.valid <- ifelse(pred>=cutoff.level.accuracy/100, "Spam", "Not Spam")
+    cf <- confusionMatrix(c.hat.valid, valid, positive = ref)
+
+    return(list(CutOff = cutoff.level.accuracy / 100,
+                AccuracyRate = accuracy[cutoff.level.accuracy],
+                FalloutRate = round(100*(cf$table[2]/(cf$table[1]+cf$table[2])),2),
+                MissRate = round(100*(cf$table[3]/(cf$table[3]+cf$table[4])),2),
+                ConfusionMatrix = table(c.hat.valid,valid),
+                FallOutVsAccuracy = cbind(Cutoff = pred.grid, FalloutRate = fallout, AccuracyRate = accuracy, 
+                                          MissRate = miss),
+                AccuracyPlot = plot(pred.grid,accuracy)))
+}
+
+```
+
+### Classification Trees
+Use a simple classification tree to understand influential predictors and look for potential interaction effects. Variables included in the tree should be included in the final model.
+
+```{r}
+# load necessary libraries
+library(tree)
+library(ISLR)
+library(caret)
+library(rpart)
+library(rpart.plot)
+
+#####################################
+### Classification Tree - Model 1 ###
+#####################################
+
+set.seed(1234)
+model.rpartfit <- rpart(is_spam ~ ., data = data.train.std.c)
+
+printcp(model.rpartfit) # display the results 
+plotcp(model.rpartfit) # visualize cross-validation results 
+summary(model.rpartfit) # detailed summary of splits
+
+par(mar=c(5,15,4,2)+0.1)
+barplot(model.rpartfit$variable.importance[order(model.rpartfit$variable.importance)], 
+        cex.names = 0.8, horiz = TRUE, cex.axis = 0.8, las=1)
+
+rpart.plot(model.rpartfit, uniform=TRUE, main="", cex = 0.8)
+
+pred.valid.rpart1 <- predict(model.rpartfit, data.valid.std.c, type="class")
+
+# calculate confusion matrix
+my.data.rpart1 <- my.function.1(pred.valid.rpart1,c.valid, ref = "Spam")
+my.data.rpart1
+
+#####################################
+### Classification Tree - Model 2 ###
+#####################################
+
+set.seed(1234)
+
+# create the model using the training data set
+model.ctree1 <- tree(is_spam ~ ., data.train.std.c)
+
+# review model summary statistics
+summary(model.ctree1)
+plot(model.ctree1)
+text(model.ctree1,pretty=0)
+model.ctree1
+
+# predict outcomes for the validation  set
+pred.valid.ctree1 <- predict(model.ctree1, data.valid.std.c, type="class")
+
+# calculate confusion matrix
+my.data.ctree1 <- my.function.1(pred.valid.ctree1,c.valid, ref = "Spam")
+my.data.ctree1
+
+
+#####################################
+### Classification Tree - Model 4 ###
+#####################################
+
+set.seed(1234)
+model.rpartfit2 <- rpart(is_spam ~ ., data = data.train.std.c[,c(1:57,112:215)])
+
+printcp(model.rpartfit2) # display the results 
+plotcp(model.rpartfit2) # visualize cross-validation results 
+summary(model.rpartfit2) # detailed summary of splits
+
+barplot(model.rpartfit2$variable.importance[order(model.rpartfit2$variable.importance)], 
+        cex.names = 0.8, horiz = TRUE, cex.axis = 0.8, las=1)
+
+rpart.plot(model.rpartfit2, uniform=TRUE, main="", cex = 0.8)
+
+pred.valid.rpart2 <- predict(model.rpartfit2, data.valid.std.c, type="class")
+
+# calculate confusion matrix
+my.data.rpart2 <- my.function.1(pred.valid.rpart2,c.valid, ref = "Spam")
+my.data.rpart2
+
+#####################################
+### Classification Tree - Model 5 ###
+#####################################
+
+set.seed(1234)
+
+# create the model using the training data set
+model.ctree2 <- tree(is_spam ~ ., data = data.train.std.c[,c(1:57,112:215)])
+
+# review model summary statistics
+summary(model.ctree2)
+plot(model.ctree2)
+text(model.ctree2,pretty=0)
+model.ctree2
+
+# predict outcomes for the validation  set
+pred.valid.ctree2 <- predict(model.ctree2, data.valid.std.c, type="class")
+
+# calculate confusion matrix
+my.data.ctree2 <- my.function.1(pred.valid.ctree2,c.valid, ref = "Spam")
+my.data.ctree2
+
+
+######################
+### Compare Models ###
+######################
+
+class.ctree.results <- cbind(my.data.rpart2, my.data.rpart2, my.data.ctree1, my.data.ctree2)
+class.ctree.results
+
+```
+
+
+```{r}
+# load necessary libraries
+library(glmnet)
+
+#######################
+### Lasso - Model 1 ###
+#######################
+
+x=model.matrix(is_spam~.,data.train.std.c)[,-215]
+y=data.train.std.c$is_spam
+grid=10^seq(10,-2,length=100)
+
+model.lasso1 <- glmnet(x, y, alpha=1, lambda=grid, family = "binomial")
+plot(model.lasso1)
+
+set.seed(1)
+cv.out=cv.glmnet(x, y,alpha=1, family = "binomial")
+plot(cv.out)
+bestlam=cv.out$lambda.min
+x.valid.std.2 <- model.matrix(is_spam~.,data.valid.std.c)[,-215]
+lasso.pred=predict(model.lasso1,s=bestlam,newx=x.valid.std.2,type="response")
+mean((lasso.pred-c.valid)^2)
+out=glmnet(x,y,alpha=1,lambda=grid, family = "binomial")
+lasso.coef1=predict(out,type="coefficients",s=bestlam)[1:215,]
+lasso.coef1
+sort(lasso.coef1[lasso.coef!=0],decreasing = TRUE)
+names(lasso.coef1[lasso.coef!=0])
+
+# predict outcomes for the validation  set
+post.valid.lasso1 <- predict(model.lasso1,s=bestlam,newx=x.valid.std.2,type="response")
+
+# calculate confusion matrix
+my.data.lasso1.accuracy <- my.function.accuracy(post.valid.lasso1, c.valid, ref = "Spam")
+my.data.lasso1.fallout <- my.function.fallout(post.valid.lasso1, c.valid, ref = "Spam")
+
+my.data.lasso1.accuracy
+my.data.lasso1.fallout
+
+#######################
+### Lasso - Model 2 ###
+#######################
+
+bestlam=cv.out$lambda.1se
+x.valid.std.2 <- model.matrix(is_spam~.,data.valid.std.c)[,-215]
+lasso.pred=predict(model.lasso1,s=bestlam,newx=x.valid.std.2,type="response")
+mean((lasso.pred-c.valid)^2)
+out=glmnet(x,y,alpha=1,lambda=grid, family = "binomial")
+lasso.coef2=predict(out,type="coefficients",s=bestlam)[1:215,]
+lasso.coef2
+sort(lasso.coef2[lasso.coef2!=0],decreasing = TRUE)
+names(lasso.coef2[lasso.coef2!=0])
+
+# predict outcomes for the validation  set
+post.valid.lasso1 <- predict(model.lasso1,s=bestlam,newx=x.valid.std.2,type="response")
+
+# calculate confusion matrix
+my.data.lasso1b.accuracy <- my.function.accuracy(post.valid.lasso1, c.valid, ref = "Spam")
+my.data.lasso1b.fallout <- my.function.fallout(post.valid.lasso1, c.valid, ref = "Spam")
+
+my.data.lasso1.accuracy
+my.data.lasso1.fallout
+
+#######################
+### Lasso - Model 3 ###
+#######################
+
+x=model.matrix(is_spam~.,data.train.std.c)[,-215]
+y=data.train.std.c$is_spam
+grid=10^seq(10,-2,length=100)
+
+model.lasso2 <- glmnet(x, y, alpha=0, lambda=grid, family = "binomial")
+plot(model.lasso2)
+
+set.seed(1)
+cv.out=cv.glmnet(x, y, alpha=0, family = "binomial")
+plot(cv.out)
+bestlam=cv.out$lambda.min
+x.valid.std.2 <- model.matrix(is_spam~.,data.valid.std.c)[,-215]
+lasso.pred=predict(model.lasso2,s=bestlam,newx=x.valid.std.2,type="response")
+mean((lasso.pred-c.valid)^2)
+out=glmnet(x,y,alpha=1,lambda=grid, family = "binomial")
+lasso.coef=predict(out,type="coefficients",s=bestlam)[1:215,]
+lasso.coef
+sort(lasso.coef[lasso.coef!=0],decreasing = TRUE)
+names(lasso.coef[lasso.coef!=0])
+
+# predict outcomes for the validation  set
+post.valid.lasso2 <- predict(model.lasso2,s=bestlam,newx=x.valid.std.2,type="response")
+
+# calculate confusion matrix
+my.data.lasso2.accuracy <- my.function.accuracy(post.valid.lasso2, c.valid, ref = "Spam")
+my.data.lasso2.fallout <- my.function.fallout(post.valid.lasso2, c.valid, ref = "Spam")
+
+my.data.lasso2.accuracy
+my.data.lasso2.fallout
+
+class.lasso.results <- cbind(my.data.lasso1.accuracy, my.data.lasso1.fallout, my.data.lasso1b.accuracy, my.data.lasso1b.fallout,
+                             my.data.lasso2.accuracy, my.data.lasso2.fallout)
+class.lasso.results
+```
+
+
+### Logistic Regression
+
+Build multiple logistic regression models and compare their performance to select the best one(s). Use the selected variables from the Best Subset variable selection and Lasso variable selection each in separate models.
+
+``` {r}
+#####################################
+### Logistic Regression - Model 1 ###
+#####################################
+
+# create the model using the training data set
+model.log1 <- glm(is_spam ~ . , data.train.std.c, family=binomial("logit"))
+
+# review model summary statistics
+coef(model.log1)
+summary(model.log1)
+
+# predict outcomes for the validation  set
+pred.valid.log1 <- predict(model.log1, data.valid.std.c, type="response") # n.valid post probs
+
+# calculate confusion matrix
+my.data.log1.accuracy <- my.function.accuracy(pred.valid.log1,c.valid,ref="Spam")
+my.data.log1.fallout <- my.function.fallout(pred.valid.log1,c.valid,ref="Spam")
+
+my.data.log1.accuracy
+my.data.log1.fallout
+
+
+#####################################
+### Logistic Regression - Model 2 ###
+#####################################
+
+# select variables that Lasso selected
+lasso.names <- c(names(lasso.coef1[lasso.coef1!=0])[2:length(names(lasso.coef1[lasso.coef1!=0]))],"is_spam")
+lasso.names[28] <- "flag_high_log_word_freq_email"
+lasso.names[29] <- "flag_high_log_word_freq_650"
+lasso.names[30] <- "flag_high_log_char_freq_semicolon"
+
+# create the model using the training data set
+model.log2 <- glm(is_spam ~ ., data.train.std.c[,lasso.names], family=binomial("logit"))
+
+# review model summary statistics
+coef(model.log2)
+summary(model.log2)
+
+# predict outcomes for the validation  set
+pred.valid.log2 <- predict(model.log2, data.valid.std.c, type="response") # n.valid post probs
+
+# calculate confusion matrix
+my.data.log2.accuracy <- my.function.accuracy(pred.valid.log2,c.valid,ref="Spam")
+my.data.log2.fallout <- my.function.fallout(pred.valid.log2,c.valid,ref="Spam")
+
+my.data.log2.accuracy 
+my.data.log2.fallout
+
+#####################################
+### Logistic Regression - Model 2 ###
+#####################################
+
+# create the model using the training data set
+model.log3 <- glm(is_spam ~ log_word_freq_conference + log_capital_run_length_total + log_word_freq_000 + log_word_freq_business + missing_word_george + missing_word_edu + missing_word_1999 + log_word_freq_meeting + log_capital_run_length_average + log_word_freq_remove + log_char_freq_dollarsign + log_char_freq_exclamation + log_word_freq_free + log_word_freq_re + log_word_freq_internet + log_word_freq_our, data.train.std.c, family=binomial("logit"))
+
+# review model summary statistics
+coef(model.log3)
+summary(model.log3)
+
+# predict outcomes for the validation  set
+pred.valid.log3 <- predict(model.log3, data.valid.std.c, type="response") # n.valid post probs
+
+# calculate confusion matrix
+my.data.log3.accuracy <- my.function.accuracy(pred.valid.log3,c.valid,ref="Spam")
+my.data.log3.fallout <- my.function.fallout(pred.valid.log3,c.valid,ref="Spam")
+
+my.data.log3.accuracy 
+my.data.log3.fallout
+
+
+######################
+### Compare Models ###
+######################
+
+class.log.results <- cbind(my.data.log1.accuracy, my.data.log1.fallout, my.data.log2.accuracy, my.data.log2.fallout)
+class.log.results
+
+```
+
+
+``` {r}
+library(e1071)
+
+#####################
+### SVM - Model 1 ###
+#####################
+
+model.svm1 <- svm(is_spam ~ ., data = data.train.std.c)
+
+# review model summary statistics
+summary(model.svm1)
+
+# predict outcomes for the validation  set
+pred.valid.svm1 <- predict(model.svm1, data.valid.std.c, type = "response") # n.valid post probs
+
+# calculate confusion matrix
+my.data.svm1 <- my.function.1(pred.valid.svm1,c.valid,ref="Spam")
+my.data.svm1
+
+#####################
+### SVM - Model 2 ###
+#####################
+
+model.svm2 <- tune.svm(is_spam ~ ., data = data.train.std.c, gamma = 10^(-6:-1), cost = 10^(1:2))
+
+# review model summary statistics
+summary.model.svm2 <- summary(model.svm2)
+summary.model.svm2
+best.gamma <- summary.model.svm2$best.parameters$gamma
+best.cost <- summary.model.svm2$best.parameters$cost
+
+# set the best model (gamme = 0.01; cost = 10)
+model.svm2.best <- summary.model.svm2$best.model
+
+# predict outcomes for the validation  set
+pred.valid.svm2 <- predict(model.svm2.best, data.valid.std.c, type = "response") # n.valid post probs
+
+# calculate confusion matrix
+my.data.svm2 <- my.function.1(pred.valid.svm2,c.valid,ref="Spam")
+my.data.svm2
+
+######################
+### Compare Models ###
+######################
+
+class.svm.results <- cbind(my.data.svm1, my.data.svm2)
+class.svm.results
+
+```
+
+
+### Bagging & Random Forests
+
+```{r}
+# load necessary libraries
+library(randomForest)
+
+########################################
+### Bagged Regression Tree - Model 1 ###
+########################################
+
+# create the model using the training data set
+set.seed(1234)
+model.reg.rf1 <- randomForest(is_spam~., data=data.train.std.c, mtry=36, importance=TRUE)
+
+# review model summary statistics
+model.reg.rf1
+importance(model.reg.rf1)
+varImpPlot(model.reg.rf1)
+
+# predict outcomes for the validation  set
+pred.reg.rf1 <- predict(model.reg.rf1,data.valid.std.c, type="response")
+my.data.reg.rf1 <- my.function.1(pred.reg.rf1, c.valid, ref = "Spam")
+my.data.reg.rf1
+
+###############################
+### Random Forest - Model 2 ###
+###############################
+
+# create the model using the training data set
+set.seed(1)
+model.reg.rf2 <- randomForest(is_spam~. , data=data.train.std.c, mtry=6, importance=TRUE)
+
+# review model summary statistics
+model.reg.rf2
+importance(model.reg.rf2)
+varImpPlot(model.reg.rf2)
+
+# predict outcomes for the validation  set
+pred.reg.rf2 <- predict(model.reg.rf2,data.valid.std.c, type="response")
+my.data.reg.rf2 <- my.function.1(pred.reg.rf2, c.valid, ref = "Spam")
+my.data.reg.rf2
+
+###############################
+### Random Forest - Model 3 ###
+###############################
+
+# create the model using the training data set
+set.seed(1)
+model.reg.rf3 <- randomForest(is_spam~. , data=data.train.std.c, mtry=18, importance=TRUE)
+
+# review model summary statistics
+model.reg.rf3
+importance(model.reg.rf3)
+varImpPlot(model.reg.rf3)
+
+# predict outcomes for the validation  set
+pred.reg.rf3 <- predict(model.reg.rf3,data.valid.std.c, type="response")
+my.data.reg.rf3 <- my.function.1(pred.reg.rf3, c.valid, ref = "Spam")
+my.data.reg.rf3
+
+###############################
+### Random Forest - Model 4 ###
+###############################
+
+# create the model using the training data set
+set.seed(1)
+model.reg.rf4 <- randomForest(is_spam~. , data=data.train.std.c, mtry=3, importance=TRUE)
+
+# review model summary statistics
+model.reg.rf4
+importance(model.reg.rf4)
+varImpPlot(model.reg.rf4)
+
+# predict outcomes for the validation  set
+pred.reg.rf4 <- predict(model.reg.rf4,data.valid.std.c, type="response")
+my.data.reg.rf4 <- my.function.1(pred.reg.rf4, c.valid, ref = "Spam")
+my.data.reg.rf4
+
+######################
+### Compare Models ###
+######################
+reg.rf.results <- cbind(my.data.reg.rf1, my.data.reg.rf2, my.data.reg.rf3, my.data.reg.rf4)
+reg.rf.results
+```
+
+### Boosting
+
+```{r}
+# load necessary libraries
+library(gbm)
+
+#########################################
+### Boosted Regression Tree - Model 1 ###
+#########################################
+
+data.train.std.c.2 <- data.train.std.c
+data.train.std.c.2$is_spam <- ifelse(data.train.std.c.2$is_spam == "Spam", 1, 0)
+
+# create the model using the training data set
+set.seed(1)
+model.reg.boost1 <- gbm(is_spam~. , data=data.train.std.c.2, n.trees=5000, interaction.depth=4)
+
+# review model summary statistics
+model.reg.boost1
+summary(model.reg.boost1)
+#plot(model.reg.boost1, i = "rgif")
+#plot(model.reg.boost1, i = "lgif")
+#plot(model.reg.boost1, i = "agif")
+
+# predict outcomes for the validation  set
+pred.reg.boost1 <- predict(model.reg.boost1, newdata=data.valid.std.c, n.trees=5000, type="response")
+
+# calculate confusion matrix
+my.data.reg.boost1.accuracy <- my.function.accuracy(pred.reg.boost1, c.valid, ref = "Spam")
+my.data.reg.boost1.fallout <- my.function.fallout(pred.reg.boost1, c.valid, ref = "Spam")
+
+#########################################
+### Boosted Regression Tree - Model 2 ###
+#########################################
+
+# create the model using the training data set
+set.seed(1)
+model.reg.boost2 <- gbm(is_spam~. , data=data.train.std.c.2, n.trees=5000, interaction.depth=4, shrinkage=0.1,verbose=F)
+
+# review model summary statistics
+model.reg.boost2
+summary(model.reg.boost2)
+#plot(model.reg.boost2, i = "rgif")
+#plot(model.reg.boost2, i = "lgif")
+#plot(model.reg.boost2, i = "agif")
+
+# predict outcomes for the validation  set
+pred.reg.boost2 <- predict(model.reg.boost2, newdata=data.valid.std.c, n.trees=5000, type="response")
+
+my.data.reg.boost2.accuracy <- my.function.accuracy(pred.reg.boost2, c.valid, ref = "Spam")
+my.data.reg.boost2.fallout <- my.function.fallout(pred.reg.boost2, c.valid, ref = "Spam")
+
+#########################################
+### Boosted Regression Tree - Model 3 ###
+#########################################
+
+# create the model using the training data set
+set.seed(1)
+model.reg.boost3 <- gbm(is_spam~. , data=data.train.std.c.2, n.trees=5000, interaction.depth=4, shrinkage=0.2,verbose=F)
+
+# review model summary statistics
+model.reg.boost3
+summary(model.reg.boost3)
+#plot(model.reg.boost3, i = "rgif")
+#plot(model.reg.boost3, i = "lgif")
+#plot(model.reg.boost3, i = "agif")
+
+# predict outcomes for the validation  set
+pred.reg.boost3 <- predict(model.reg.boost3, newdata=data.valid.std.c, n.trees=5000, type = "response")
+
+# calculate confusion matrix
+my.data.reg.boost3.accuracy <- my.function.accuracy(pred.reg.boost3, c.valid, ref = "Spam")
+my.data.reg.boost3.fallout <- my.function.fallout(pred.reg.boost3, c.valid, ref = "Spam")
+
+#########################################
+### Boosted Regression Tree - Model 4 ###
+#########################################
+
+library(dismo)
+
+# create the model using the training data set
+set.seed(1)
+model.reg.boost4 <- gbm.step(data=data.train.std.c.2, gbm.x = 1:214, gbm.y = 215, tree.complexity = 5, learning.rate = 0.01, bag.fraction = 0.5)
+
+# review model summary statistics
+summary(model.reg.boost4)
+#plot(model.reg.boost4, i = "rgif")
+#plot(model.reg.boost4, i = "lgif")
+#plot(model.reg.boost4, i = "agif")
+
+# predict outcomes for the validation  set
+pred.reg.boost4 <- predict(model.reg.boost4, newdata=data.valid.std.c, n.trees=1050, type="response")
+
+# calculate confusion matrix
+my.data.reg.boost4.accuracy <- my.function.accuracy(pred.reg.boost4, c.valid, ref = "Spam")
+my.data.reg.boost4.fallout <- my.function.fallout(pred.reg.boost4, c.valid, ref = "Spam")
+
+
+######################
+### Compare Models ###
+######################
+reg.boost.results <- cbind(my.data.reg.boost1.accuracy, my.data.reg.boost1.fallout, my.data.reg.boost2.accuracy, my.data.reg.boost2.fallout, my.data.reg.boost3.accuracy, my.data.reg.boost3.fallout, my.data.reg.boost4.accuracy, my.data.reg.boost4.fallout)
+
+reg.boost.results
+```
+
+
+
+
+
+
+\pagebreak
+
+# Appendix
+
+### Table A.1: Description of data
+
+**Variable Name** | **Data Type** | **Description**
+------------------------- | ----------------| ---------------------------------------------
+word_freq_make |           continuous [0,100]| % of words in email that match "make"
+word_freq_address |         continuous [0,100]| % of words in email that match "address"
+word_freq_all |             continuous [0,100]| % of words in email that match "all"
+word_freq_3d |              continuous [0,100]| % of words in email that match "3d"
+word_freq_our |             continuous [0,100]| % of words in email that match "our"
+word_freq_over |            continuous [0,100]| % of words in email that match "over"
+word_freq_remove |          continuous [0,100]| % of words in email that match "remove"
+word_freq_internet  |       continuous [0,100]| % of words in email that match "internet"
+word_freq_order  |          continuous [0,100]| % of words in email that match "order"
+word_freq_mail  |           continuous [0,100]| % of words in email that match "mail"
+word_freq_receive  |        continuous [0,100]| % of words in email that match "receive"
+word_freq_will  |           continuous [0,100]| % of words in email that match "will"
+word_freq_people  |         continuous [0,100]| % of words in email that match "people"
+word_freq_report  |         continuous [0,100]| % of words in email that match "report"
+word_freq_addresses  |      continuous [0,100]| % of words in email that match "addresses"
+word_freq_free  |           continuous [0,100]| % of words in email that match "free"
+word_freq_business  |       continuous [0,100]| % of words in email that match "business"
+word_freq_email  |          continuous [0,100]| % of words in email that match "email"
+word_freq_you  |            continuous [0,100]| % of words in email that match "you"
+word_freq_credit  |         continuous [0,100]| % of words in email that match "credit"
+word_freq_your  |           continuous [0,100]| % of words in email that match "your"
+word_freq_font  |           continuous [0,100]| % of words in email that match "font"
+word_freq_000  |            continuous [0,100]| % of words in email that match "000"
+word_freq_money  |          continuous [0,100]| % of words in email that match "money"
+word_freq_hp  |             continuous [0,100]| % of words in email that match "hp"
+word_freq_hpl  |            continuous [0,100]| % of words in email that match "hpl"
+word_freq_george  |         continuous [0,100]| % of words in email that match "george"
+word_freq_650  |            continuous [0,100]| % of words in email that match "650"
+word_freq_lab  |            continuous [0,100]| % of words in email that match "lab"
+word_freq_labs  |           continuous [0,100]| % of words in email that match "labs"
+word_freq_telnet  |         continuous [0,100]| % of words in email that match "telnet"
+word_freq_857  |            continuous [0,100]| % of words in email that match "857"
+word_freq_data  |           continuous [0,100]| % of words in email that match "data"
+word_freq_415  |            continuous [0,100]| % of words in email that match "415"
+word_freq_85  |             continuous [0,100]| % of words in email that match "85"
+word_freq_technology  |     continuous [0,100]| % of words in email that match "technology"
+word_freq_1999  |           continuous [0,100]| % of words in email that match "1999"
+word_freq_parts  |          continuous [0,100]| % of words in email that match "parts"
+word_freq_pm  |             continuous [0,100]| % of words in email that match "pm"
+word_freq_direct   |        continuous [0,100]| % of words in email that match "direct"
+word_freq_cs   |            continuous [0,100]| % of words in email that match "cs"
+word_freq_meeting   |       continuous [0,100]| % of words in email that match "meeting"
+word_freq_original   |      continuous [0,100]| % of words in email that match "original"
+word_freq_project   |       continuous [0,100]| % of words in email that match "project"
+word_freq_re   |            continuous [0,100]| % of words in email that match "re"
+word_freq_edu   |           continuous [0,100]| % of words in email that match "edu"
+word_freq_table   |         continuous [0,100]| % of words in email that match "table"
+word_freq_conference   |    continuous [0,100]| % of words in email that match "conference"
+char_freq_semicolon   |     continuous [0,100]| % of characters in email that match ";"
+char_freq_parantheses   |   continuous [0,100]| % of characters in email that match "("
+char_freq_brackets   |      continuous [0,100]| % of characters in email that match "["
+char_freq_exclamation   |   continuous [0,100]| % of characters in email that match "!"
+char_freq_dollarsign   |    continuous [0,100]| % of characters in email that match "$"
+char_freq_hashtag   |       continuous [0,100]| % of characters in email that match "#"
+capital_run_length_average | continuous [1,...]| Avg. length of uninterrupted seq. of capital letters.
+capital_run_length_longest | continuous [1,...]| Longest length of uninterrupted seq. of capital letters.
+capital_run_length_total   | continuous [1,...]| Total length of uninterrupted seq. of capital letters.
+is_spam |                    nominal {0,1}   | **Response Variable.** Whether the message is spam (1) or not (0).
+
+###
+```{r responseplotsdisplay, echo = FALSE, include = TRUE, fig.width = 8, fig.height = 2.5, warning=FALSE, message=FALSE}
+```
